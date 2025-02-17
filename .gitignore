@@ -1,0 +1,15 @@
+.idea/
+
+# Ignore build and dependency directories
+target/
+node_modules/
+
+# Ignore environment and secret files
+.env
+#application.yml
+#application.propertiestarget/
+node_modules/
+.idea/
+*.log
+*.jar
+.DS_Store
