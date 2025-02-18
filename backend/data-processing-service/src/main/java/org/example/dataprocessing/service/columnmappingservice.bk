@@ -1,0 +1,192 @@
+package org.example.dataprocessing.service;
+
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+import org.example.dataprocessing.messaging.TransactionMessageProducer;
+import org.example.dataprocessing.model.ColumnMapping;
+import org.example.dataprocessing.repository.ColumnMappingRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+@Service
+public class ColumnMappingService {
+
+    private static final Logger logger = LoggerFactory.getLogger(ColumnMappingService.class);
+    private static final String UPLOAD_DIR = "uploads/";
+    private final ColumnMappingRepository columnMappingRepository;
+    private final TransactionMessageProducer messageProducer;
+    private final ThreadPoolTaskExecutor columnMappingExecutor;
+
+    private final Map<UUID, String> fileProcessingStatus = new ConcurrentHashMap<>();
+
+    public ColumnMappingService(ColumnMappingRepository columnMappingRepository,
+                                TransactionMessageProducer messageProducer,
+                                ThreadPoolTaskExecutor columnMappingExecutor) {
+        this.columnMappingRepository = columnMappingRepository;
+        this.messageProducer = messageProducer;
+        this.columnMappingExecutor = columnMappingExecutor;
+    }
+    public void saveColumnMapping(UUID fileId, Map<String, String> mappings) {
+        if (columnMappingRepository.findByFileId(fileId).isPresent()) {
+            throw new IllegalArgumentException("Mapping already exists for this file.");
+        }
+
+        columnMappingRepository.save(new ColumnMapping(fileId, mappings));
+        logger.info("Saved column mapping for file {}", fileId);
+
+        // Auto-trigger CSV processing after saving mapping
+        startProcessing(fileId);
+    }
+
+    /**
+     * Starts async processing of a CSV file using CompletableFuture.
+     */
+    public Map<String, Object> startProcessing(UUID fileId) {
+        fileProcessingStatus.put(fileId, "PROCESSING");
+        logger.info("CSV processing started for file {}", fileId);
+
+        CompletableFuture.runAsync(() -> processCsvFile(fileId), columnMappingExecutor)
+                .exceptionally(ex -> {
+                    logger.error("Error processing file {}: {}", fileId, ex.getMessage(), ex);
+                    fileProcessingStatus.put(fileId, "FAILED: " + ex.getMessage());
+                    return null;
+                });
+
+        return Map.of("fileId", fileId, "message", "CSV processing started. Check status using /api/mapping/status/{fileId}.");
+    }
+    /**
+     * Retrieves column mapping for a given fileId.
+     */
+    public Optional<Map<String, String>> getColumnMapping(UUID fileId) {
+        return columnMappingRepository.findByFileId(fileId)
+                .map(ColumnMapping::getMappings);
+    }
+    /**
+     * Retrieves processing status for a file.
+     */
+    public String getProcessingStatus(UUID fileId) {
+        return fileProcessingStatus.getOrDefault(fileId, "NOT_FOUND");
+    }
+
+    /**
+     * Reads and processes a CSV file using parallel validation.
+     */
+    private void processCsvFile(UUID fileId) {
+        Optional<ColumnMapping> mappingOpt = columnMappingRepository.findByFileId(fileId);
+        if (mappingOpt.isEmpty()) {
+            logger.error("No column mapping found for file {}", fileId);
+            fileProcessingStatus.put(fileId, "FAILED: No column mapping found.");
+            return;
+        }
+
+        ColumnMapping mapping = mappingOpt.get();
+        Path filePath = Path.of(UPLOAD_DIR, fileId + ".csv");
+
+        List<CSVRecord> records;
+        try (BufferedReader reader = new BufferedReader(new FileReader(filePath.toFile()));
+             CSVParser parser = new CSVParser(reader, CSVFormat.DEFAULT.withFirstRecordAsHeader())) {
+
+            records = parser.getRecords();
+
+        } catch (Exception e) {
+            logger.error("Error processing CSV file {}: {}", fileId, e.getMessage(), e);
+            fileProcessingStatus.put(fileId, "FAILED: " + e.getMessage());
+            return;
+        }
+
+        logger.info("Processing {} records from file {}", records.size(), fileId);
+
+        List<String> errors = validateRecordsInParallel(records, mapping.getMappings());
+
+        if (!errors.isEmpty()) {
+            fileProcessingStatus.put(fileId, "FAILED: " + errors.size() + " validation errors found.");
+            return;
+        }
+
+        // If valid, send fileId to transaction-service
+        messageProducer.sendFileIdToTransactionService(fileId);
+        fileProcessingStatus.put(fileId, "COMPLETED");
+    }
+
+    /**
+     * Validates CSV records in parallel.
+     */
+    private List<String> validateRecordsInParallel(List<CSVRecord> records, Map<String, String> mappings) {
+        int batchSize = 10000;
+        int totalBatches = (int) Math.ceil((double) records.size() / batchSize);
+
+        List<CompletableFuture<List<String>>> validationFutures = IntStream.range(0, totalBatches)
+                .mapToObj(batchIndex -> CompletableFuture.supplyAsync(() -> {
+                    int start = batchIndex * batchSize;
+                    int end = Math.min(start + batchSize, records.size());
+                    logger.info("Validating batch {} ({} - {})", batchIndex + 1, start, end);
+
+                    Set<String> transactionIds = new HashSet<>();
+                    List<String> batchErrors = new ArrayList<>();
+
+                    for (int i = start; i < end; i++) {
+                        String error = validateRecord(records.get(i), mappings, transactionIds);
+                        if (!error.isEmpty()) {
+                            batchErrors.add(error);
+                        }
+                    }
+                    return batchErrors;
+                }, columnMappingExecutor))
+                .collect(Collectors.toList());
+
+        return validationFutures.stream()
+                .map(CompletableFuture::join)
+                .flatMap(List::stream)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Validates a single CSV record.
+     */
+    private String validateRecord(CSVRecord record, Map<String, String> mappings, Set<String> transactionIds) {
+        StringBuilder error = new StringBuilder();
+
+        // Validate TransactionID (Unique)
+        if (mappings.containsKey("TransactionID")) {
+            String transactionId = record.get(mappings.get("TransactionID"));
+            if (transactionId.isEmpty()) {
+                error.append("Row ").append(record.getRecordNumber()).append(": Missing TransactionID. ");
+            } else if (!transactionIds.add(transactionId)) {
+                error.append("Row ").append(record.getRecordNumber()).append(": Duplicate TransactionID. ");
+            }
+        }
+
+        // Validate TransactionDate format (YYYY-MM-DD)
+        if (mappings.containsKey("TransactionDate")) {
+            String date = record.get(mappings.get("TransactionDate"));
+            if (!date.matches("\\d{4}-\\d{2}-\\d{2}")) {
+                error.append("Row ").append(record.getRecordNumber()).append(": Invalid date format. ");
+            }
+        }
+
+        // Validate numeric fields
+        for (String field : List.of("TransactionGrossSalesAmount", "TransactionSalesTaxAmount")) {
+            if (mappings.containsKey(field)) {
+                String value = record.get(mappings.get(field));
+                if (!value.matches("\\d+(\\.\\d{1,2})?")) {
+                    error.append("Row ").append(record.getRecordNumber()).append(": Invalid numeric value in ").append(field).append(". ");
+                }
+            }
+        }
+
+        return error.toString().trim();
+    }
+}
