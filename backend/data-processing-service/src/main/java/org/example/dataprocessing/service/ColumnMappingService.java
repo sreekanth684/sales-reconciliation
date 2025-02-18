@@ -12,7 +12,6 @@ import org.example.dataprocessing.repository.FileProcessingStatusRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,39 +19,31 @@ import java.io.BufferedReader;
 import java.io.FileReader;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.*;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 public class ColumnMappingService {
 
     private static final Logger logger = LoggerFactory.getLogger(ColumnMappingService.class);
-    @Value("${file.upload-dir}")
-    private String uploadDir = "uploads/";
     private final ColumnMappingRepository columnMappingRepository;
     private final FileProcessingStatusRepository fileProcessingStatusRepository;
     private final TransactionMessageProducer transactionMessageProducer;
-
-    private CsvProcessingProducer csvProcessingProducer;
-
-    private final ThreadPoolTaskExecutor columnMappingExecutor;
+    private final CsvProcessingProducer csvProcessingProducer;
     private final ObjectMapper objectMapper = new ObjectMapper();
-
     private final Map<UUID, String> fileProcessingStatusCache = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> fileErrorCountCache = new ConcurrentHashMap<>();
+    @Value("${file.upload-dir}")
+    private String uploadDir = "uploads/";
 
     public ColumnMappingService(ColumnMappingRepository columnMappingRepository,
                                 FileProcessingStatusRepository fileProcessingStatusRepository,
                                 TransactionMessageProducer transactionMessageProducer,
-                                CsvProcessingProducer csvProcessingProducer,
-                                ThreadPoolTaskExecutor columnMappingExecutor) {
+                                CsvProcessingProducer csvProcessingProducer) {
         this.columnMappingRepository = columnMappingRepository;
         this.fileProcessingStatusRepository = fileProcessingStatusRepository;
         this.transactionMessageProducer = transactionMessageProducer;
-        this.columnMappingExecutor = columnMappingExecutor;
-        this.csvProcessingProducer = csvProcessingProducer;
+        this.csvProcessingProducer =csvProcessingProducer;
     }
 
     public void saveColumnMapping(UUID fileId, Map<String, String> mappings) {
@@ -65,29 +56,29 @@ public class ColumnMappingService {
         startProcessing(fileId);
     }
 
-//    public void startProcessing(UUID fileId) {
-//        fileProcessingStatusCache.put(fileId, "PROCESSING");
-//        fileErrorCountCache.put(fileId, 0);
-//        logger.info("CSV processing started for file {}", fileId);
-//
-//        CompletableFuture.runAsync(() -> processCsvFile(fileId), columnMappingExecutor)
-//                .exceptionally(ex -> {
-//                    logger.error(" Error processing file {}: {}", fileId, ex.getMessage(), ex);
-//                    updateProcessingStatus(fileId, "FAILED", 0, List.of(ex.getMessage()));
-//                    return null;
-//                });
-//    }
     public void startProcessing(UUID fileId) {
-        fileProcessingStatusCache.put(fileId, "PROCESSING");
-        fileErrorCountCache.put(fileId, 0);
-        logger.info("Queuing file {} for processing via RabbitMQ", fileId);
-        updateProcessingStatus(fileId, "PROCESSING", 0, List.of());
+        try{
+            fileProcessingStatusCache.put(fileId, "PROCESSING");
+            fileErrorCountCache.put(fileId, 0);
+            logger.info("Processing started for file {}", fileId);
 
-        csvProcessingProducer.sendFileIdForProcessing(fileId);
+            updateProcessingStatus(fileId, "PROCESSING", 0, List.of());
+
+            // Send file ID to RabbitMQ for async processing
+            csvProcessingProducer.sendFileIdForProcessing(fileId);
+        }catch (Exception e) {
+            logger.error(" Error starting processing for file {}: {}", fileId, e.getMessage(), e);
+            try {
+                updateProcessingStatus(fileId, "FAILED", 0, List.of(" System error: " + e.getMessage()));
+            } catch (Exception dbError) {
+                logger.error(" Error updating status in catch block for file {}: {}", fileId, dbError.getMessage(), dbError);
+            }
+        }
+        
     }
 
     public void processCsvFile(UUID fileId) {
-        try {
+        try{
             Optional<ColumnMapping> mappingOpt = columnMappingRepository.findByFileId(fileId);
             if (mappingOpt.isEmpty()) {
                 logger.error(" No column mapping found for file {}", fileId);
@@ -98,17 +89,24 @@ public class ColumnMappingService {
             ColumnMapping mapping = mappingOpt.get();
             Path filePath = Path.of(uploadDir, fileId + ".csv");
 
-            List<CSVRecord> records;
+            // Shared transaction ID set for global duplicate tracking across all records
+            Set<String> transactionIds = ConcurrentHashMap.newKeySet();
+            List<String> errors = new ArrayList<>();
+
             try (BufferedReader reader = new BufferedReader(new FileReader(filePath.toFile()));
                  CSVParser parser = new CSVParser(reader, CSVFormat.DEFAULT.withFirstRecordAsHeader())) {
-                records = parser.getRecords();
+
+                for (CSVRecord record : parser) {  // Reads and validates each row immediately
+                    String error = validateRecord(record, mapping.getMappings(), transactionIds);
+                    if (!error.isEmpty()) {
+                        errors.add(error);
+                    }
+                }
             } catch (Exception e) {
                 logger.error(" Error processing CSV file {}: {}", fileId, e.getMessage(), e);
                 updateProcessingStatus(fileId, "FAILED", 0, List.of(e.getMessage()));
                 return;
             }
-
-            List<String> errors = validateRecordsInParallel(records, mapping.getMappings());
 
             if (!errors.isEmpty()) {
                 updateProcessingStatus(fileId, "FAILED", errors.size(), errors);
@@ -117,10 +115,16 @@ public class ColumnMappingService {
 
             transactionMessageProducer.sendFileIdToTransactionService(fileId);
             updateProcessingStatus(fileId, "COMPLETED", 0, null);
-        } catch (Exception e) {
-            logger.error("Unexpected error processing file {}: {}", fileId, e.getMessage(), e);
-            updateProcessingStatus(fileId, "FAILED", 0, List.of("Unexpected processing error: " + e.getMessage()));
+        }catch (Exception e) {
+            logger.error(" Critical error processing file {}: {}", fileId, e.getMessage(), e);
+
+            try {
+                updateProcessingStatus(fileId, "FAILED", 0, List.of(" System error: " + e.getMessage()));
+            } catch (Exception dbError) {
+                logger.error(" Error updating status in catch block for file {}: {}", fileId, dbError.getMessage(), dbError);
+            }
         }
+
     }
 
     @Transactional
@@ -132,10 +136,13 @@ public class ColumnMappingService {
             fileErrorCountCache.put(fileId, errorCount);
 
             fileProcessingStatusRepository.updateProcessingStatus(fileId, status, errorCount, errorJson);
+            logger.info(" Successfully updated processing status for file {}", fileId);
         } catch (Exception e) {
-            logger.error(" Error updating processing status: {}", e.getMessage(), e);
+            logger.error(" Error updating processing status for file {}: {}", fileId, e.getMessage(), e);
+            throw new RuntimeException(" Failed to update processing status for file: " + fileId, e);
         }
     }
+
 
     public Map<String, Object> getProcessingStatus(UUID fileId) {
         if (fileProcessingStatusCache.containsKey(fileId)) {
@@ -182,29 +189,13 @@ public class ColumnMappingService {
         }
     }
 
-    private List<String> validateRecordsInParallel(List<CSVRecord> records, Map<String, String> mappings) {
-        int batchSize = 10000;
-        int totalBatches = (int) Math.ceil((double) records.size() / batchSize);
-
-        return IntStream.range(0, totalBatches)
-                .parallel()
-                .mapToObj(batchIndex -> records.subList(batchIndex * batchSize,
-                                Math.min((batchIndex + 1) * batchSize, records.size()))
-                        .stream()
-                        .map(record -> validateRecord(record, mappings, new HashSet<>()))
-                        .filter(error -> !error.isEmpty())
-                        .collect(Collectors.toList()))
-                .flatMap(Collection::stream)
-                .collect(Collectors.toList());
-    }
-
     private String validateRecord(CSVRecord record, Map<String, String> mappings, Set<String> transactionIds) {
         StringBuilder error = new StringBuilder();
 
         if (mappings.containsKey("TransactionID")) {
             String transactionId = record.get(mappings.get("TransactionID"));
             if (transactionId.isEmpty() || !transactionIds.add(transactionId)) {
-                error.append("Row ").append(record.getRecordNumber()).append(": Invalid or duplicate TransactionID. ");
+                error.append("Row ").append(record.getRecordNumber()).append(": Duplicate or missing TransactionID. ");
             }
         }
 
