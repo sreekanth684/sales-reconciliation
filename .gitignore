@@ -3,6 +3,7 @@
 # Ignore build and dependency directories
 target/
 node_modules/
+uploads/
 
 # Ignore environment and secret files
 .env
