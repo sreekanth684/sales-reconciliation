@@ -47,12 +47,20 @@ public class ColumnMappingService {
     }
 
     public void saveColumnMapping(UUID fileId, Map<String, String> mappings) {
-        if (columnMappingRepository.findByFileId(fileId).isPresent()) {
-            throw new IllegalArgumentException("Mapping already exists for this file.");
+        Optional<ColumnMapping> existingMapping = columnMappingRepository.findByFileId(fileId);
+
+        if (existingMapping.isPresent()) {
+            //  Update existing mappings instead of throwing an error
+            ColumnMapping columnMapping = existingMapping.get();
+            columnMapping.setMappings(mappings);
+            columnMappingRepository.save(columnMapping);
+            logger.info(" Updated column mapping for file {}", fileId);
+        } else {
+            //  Insert new mapping if not present
+            columnMappingRepository.save(new ColumnMapping(fileId, mappings));
+            logger.info(" Saved new column mapping for file {}", fileId);
         }
 
-        columnMappingRepository.save(new ColumnMapping(fileId, mappings));
-        logger.info("Saved column mapping for file {}", fileId);
         startProcessing(fileId);
     }
 
@@ -193,14 +201,14 @@ public class ColumnMappingService {
         StringBuilder error = new StringBuilder();
 
         if (mappings.containsKey("TransactionID")) {
-            String transactionId = record.get(mappings.get("TransactionID"));
+            String transactionId = record.get("TransactionID");
             if (transactionId.isEmpty() || !transactionIds.add(transactionId)) {
                 error.append("Row ").append(record.getRecordNumber()).append(": Duplicate or missing TransactionID. ");
             }
         }
 
         if (mappings.containsKey("TransactionDate")) {
-            String date = record.get(mappings.get("TransactionDate"));
+            String date = record.get("TransactionDate");
             if (!Pattern.matches("\\d{4}-\\d{2}-\\d{2}", date)) {
                 error.append("Row ").append(record.getRecordNumber()).append(": Invalid date format. ");
             }
