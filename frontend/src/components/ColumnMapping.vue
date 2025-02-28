@@ -41,7 +41,7 @@
 
       <!-- File Processing Status Section -->
       <div class="mt-5">
-        <h4>Check File Processing Status</h4>
+        <h4>Check File Data Validation Status</h4>
   
         <!-- Input for File ID -->
         <div class="mb-3">

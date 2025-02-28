@@ -40,7 +40,7 @@
   
       <!-- File Processing Status -->
       <div v-if="uploadSuccess && fileStatusDetails" class="mt-4">
-        <h5>File Processing Status:</h5>
+        <h5>File Storage Details:</h5>
         <ul class="list-group">
           <li class="list-group-item">
             <strong>Status:</strong>
