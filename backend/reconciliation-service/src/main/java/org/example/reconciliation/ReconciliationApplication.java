@@ -1,4 +1,4 @@
-package com.example.reconciliation;
+package org.example.reconciliation;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
