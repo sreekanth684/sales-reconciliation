@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 import java.util.UUID;
 
+@CrossOrigin(origins = "http://localhost:5173")
 @RestController
 @RequestMapping("/api/mapping")
 public class ColumnMappingController {
@@ -24,22 +25,33 @@ public class ColumnMappingController {
      * Saves column mapping and starts CSV processing.
      */
     @PostMapping
-    public ResponseEntity<String> saveMapping(@RequestBody Map<String, Object> request) {
+    public ResponseEntity<Map<String, Object>> saveMapping(@RequestBody Map<String, Object> request) {
         try {
             UUID fileId = UUID.fromString(request.get("fileId").toString());
             Map<String, String> mappings = (Map<String, String>) request.get("mappings");
 
             if (fileId == null || mappings == null || mappings.isEmpty()) {
-                return ResponseEntity.badRequest().body(" Invalid request: fileId and mappings are required.");
+                return ResponseEntity.badRequest().body(Map.of(
+                        "message", "Invalid request: fileId and mappings are required."
+                ));
             }
 
             columnMappingService.saveColumnMapping(fileId, mappings);
-            return ResponseEntity.ok("Mapping saved successfully. Processing started.");
+
+            return ResponseEntity.ok(Map.of(
+                    "fileId", fileId,
+                    "message", "Mapping saved successfully. Async file data validation process started."
+            ));
         } catch (Exception e) {
-            logger.error(" Error saving mapping: {}", e.getMessage(), e);
-            return ResponseEntity.badRequest().body(" Error saving mapping: " + e.getMessage());
+            logger.error("Error saving mapping: {}", e.getMessage(), e);
+
+            return ResponseEntity.badRequest().body(Map.of(
+                    "fileId", request.get("fileId"),
+                    "message", "Error saving mapping: " + e.getMessage()
+            ));
         }
     }
+
 
     /**
      * Retrieves processing status (status & error count only).

@@ -163,12 +163,22 @@ public class ColumnMappingService {
         }
 
         Optional<Object[]> result = fileProcessingStatusRepository.findProcessingStatus(fileId);
+        logger.info("Processing status query result for fileId {}: {}", fileId, result);
+
         if (result.isEmpty()) {
             return Map.of("fileId", fileId, "status", "NOT_FOUND");
         }
 
-        String status = (String) result.get()[0];
-        int errorCount = (int) result.get()[1];
+        Object[] outerArray = result.get();
+        if (outerArray.length == 0 || !(outerArray[0] instanceof Object[] innerArray)) {
+            return Map.of("fileId", fileId, "status", "NOT_FOUND");
+        }
+
+        logger.info("Row retrieved from DB for fileId {}: {}", fileId, Arrays.deepToString(innerArray));
+
+        String status = innerArray[0] != null ? innerArray[0].toString() : "UNKNOWN";
+        int errorCount = (innerArray.length > 1 && innerArray[1] instanceof Number) ? ((Number) innerArray[1]).intValue() : 0;
+
 
         fileProcessingStatusCache.put(fileId, status);
         fileErrorCountCache.put(fileId, errorCount);
